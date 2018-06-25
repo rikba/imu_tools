@@ -29,6 +29,8 @@
 #include <sensor_msgs/Imu.h>
 #include <sensor_msgs/MagneticField.h>
 #include <geometry_msgs/Vector3Stamped.h>
+#include <tf2/LinearMath/Matrix3x3.h>
+#include <tf2/LinearMath/Vector3.h>
 #include "tf2_ros/transform_broadcaster.h"
 #include <message_filters/subscriber.h>
 #include <message_filters/synchronizer.h>
@@ -92,7 +94,10 @@ class ImuFilterRos
     std::string imu_frame_;
     double constant_dt_;
     bool publish_debug_topics_;
-    geometry_msgs::Vector3 mag_bias_;
+    tf2::Vector3 mag_bias_;
+    tf2::Matrix3x3 mag_compensation_;
+    double mag_declination_;
+
     double orientation_variance_;
 
     // **** state variables
@@ -116,6 +121,9 @@ class ImuFilterRos
 
     void publishRawMsg(const ros::Time& t,
                        float roll, float pitch, float yaw);
+
+    void getDeclinationCompensatedOrientation(double& q0, double& q1,
+                                              double& q2, double& q3);
 
     void reconfigCallback(FilterConfig& config, uint32_t level);
     void checkTopicsTimerCallback(const ros::TimerEvent&);

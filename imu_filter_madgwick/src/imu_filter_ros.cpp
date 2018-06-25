@@ -27,6 +27,7 @@
 #include "geometry_msgs/TransformStamped.h"
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2/LinearMath/Matrix3x3.h>
+#include <tf2/LinearMath/Vector3.h>
 
 ImuFilterRos::ImuFilterRos(ros::NodeHandle nh, ros::NodeHandle nh_private):
   nh_(nh),
@@ -52,6 +53,44 @@ ImuFilterRos::ImuFilterRos(ros::NodeHandle nh, ros::NodeHandle nh_private):
     publish_debug_topics_= false;
   if (!nh_private_.getParam ("use_magnetic_field_msg", use_magnetic_field_msg_))
     use_magnetic_field_msg_ = true;
+
+  // Magnetometer calibration.
+  // Hard iron.
+  std::vector<double> mag_bias;
+  if (!nh_private_.getParam("mag_bias", mag_bias) || mag_bias.size() != 3) {
+    mag_bias_.setZero();
+  } else {
+    mag_bias_.setX(mag_bias[0]);
+    mag_bias_.setY(mag_bias[1]);
+    mag_bias_.setZ(mag_bias[2]);
+  }
+  ROS_INFO("Magnetometer bias values: %f %f %f", mag_bias_.getX(),
+           mag_bias_.getY(), mag_bias_.getZ());
+
+  // Soft iron.
+  std::vector<double> mag_compensation;
+  if (!nh_private_.getParam("mag_compensation", mag_compensation) ||
+      mag_compensation.size() != 9) {
+    mag_compensation_.setIdentity();
+  } else {
+    mag_compensation_.setValue(
+        mag_compensation[0], mag_compensation[1], mag_compensation[2],
+        mag_compensation[3], mag_compensation[4], mag_compensation[5],
+        mag_compensation[6], mag_compensation[7], mag_compensation[8]);
+  }
+  ROS_INFO(
+      "Magnetometer compensation matrix:\n%f, %f, %f\n%f, %f, %f\n%f, %f, %f",
+      mag_compensation_.getRow(0).getX(), mag_compensation_.getRow(0).getY(),
+      mag_compensation_.getRow(0).getZ(), mag_compensation_.getRow(1).getX(),
+      mag_compensation_.getRow(1).getY(), mag_compensation_.getRow(1).getZ(),
+      mag_compensation_.getRow(2).getX(), mag_compensation_.getRow(2).getY(),
+      mag_compensation_.getRow(2).getZ());
+
+  // Declination.
+  if (!nh_private_.getParam("mag_declination", mag_declination_)) {
+    mag_declination_ = 0.0;
+  }
+  ROS_INFO("Magnetometer declination: %f", mag_declination_);
 
   std::string world_frame;
   // Default should become false for next release
@@ -219,11 +258,18 @@ void ImuFilterRos::imuMagCallback(
   ros::Time time = imu_msg_raw->header.stamp;
   imu_frame_ = imu_msg_raw->header.frame_id;
 
-  /*** Compensate for hard iron ***/
-  geometry_msgs::Vector3 mag_compensated;
-  mag_compensated.x = mag_fld.x - mag_bias_.x;
-  mag_compensated.y = mag_fld.y - mag_bias_.y;
-  mag_compensated.z = mag_fld.z - mag_bias_.z;
+  /*** Compensate for soft and hard iron ***/
+  tf2::Vector3 mag_compensated(mag_fld.x, mag_fld.y, mag_fld.z);
+  mag_compensated -= mag_bias_;
+  tf2::Vector3 temp_mag_compensated = mag_compensated;
+  mag_compensated.setX(mag_compensation_.getRow(0).dot(temp_mag_compensated));
+  mag_compensated.setY(mag_compensation_.getRow(1).dot(temp_mag_compensated));
+  mag_compensated.setZ(mag_compensation_.getRow(2).dot(temp_mag_compensated));
+
+  geometry_msgs::Vector3 mag_compensated_geom;
+  mag_compensated_geom.x = mag_compensated.getX();
+  mag_compensated_geom.y = mag_compensated.getY();
+  mag_compensated_geom.z = mag_compensated.getZ();
 
   double roll = 0.0;
   double pitch = 0.0;
@@ -244,7 +290,7 @@ void ImuFilterRos::imuMagCallback(
     }
 
     geometry_msgs::Quaternion init_q;
-    StatelessOrientation::computeOrientation(world_frame_, lin_acc, mag_compensated, init_q);
+    StatelessOrientation::computeOrientation(world_frame_, lin_acc, mag_compensated_geom, init_q);
     filter_.setOrientation(init_q.w, init_q.x, init_q.y, init_q.z);
 
     last_time_ = time;
@@ -269,7 +315,7 @@ void ImuFilterRos::imuMagCallback(
     filter_.madgwickAHRSupdate(
       ang_vel.x, ang_vel.y, ang_vel.z,
       lin_acc.x, lin_acc.y, lin_acc.z,
-      mag_compensated.x, mag_compensated.y, mag_compensated.z,
+      mag_compensated_geom.x, mag_compensated_geom.y, mag_compensated_geom.z,
       dt);
 
   publishFilteredMsg(imu_msg_raw);
@@ -279,7 +325,7 @@ void ImuFilterRos::imuMagCallback(
   if(publish_debug_topics_)
   {
     geometry_msgs::Quaternion orientation;
-    if (StatelessOrientation::computeOrientation(world_frame_, lin_acc, mag_compensated, orientation))
+    if (StatelessOrientation::computeOrientation(world_frame_, lin_acc, mag_compensated_geom, orientation))
     {
       tf2::Matrix3x3(tf2::Quaternion(orientation.x, orientation.y, orientation.z, orientation.w)).getRPY(roll, pitch, yaw, 0);
       publishRawMsg(time, roll, pitch, yaw);
@@ -290,7 +336,7 @@ void ImuFilterRos::imuMagCallback(
 void ImuFilterRos::publishTransform(const ImuMsg::ConstPtr& imu_msg_raw)
 {
   double q0,q1,q2,q3;
-  filter_.getOrientation(q0,q1,q2,q3);
+  getDeclinationCompensatedOrientation(q0, q1, q2, q3);
   geometry_msgs::TransformStamped transform;
   transform.header.stamp = imu_msg_raw->header.stamp;
   if (reverse_tf_)
@@ -317,7 +363,7 @@ void ImuFilterRos::publishTransform(const ImuMsg::ConstPtr& imu_msg_raw)
 void ImuFilterRos::publishFilteredMsg(const ImuMsg::ConstPtr& imu_msg_raw)
 {
   double q0,q1,q2,q3;
-  filter_.getOrientation(q0,q1,q2,q3);
+  getDeclinationCompensatedOrientation(q0, q1, q2, q3);
 
   // create and publish filtered IMU message
   boost::shared_ptr<ImuMsg> imu_msg =
@@ -362,6 +408,21 @@ void ImuFilterRos::publishRawMsg(const ros::Time& t,
   rpy_raw_debug_publisher_.publish(rpy);
 }
 
+void ImuFilterRos::getDeclinationCompensatedOrientation(double& q0, double& q1,
+                                                        double& q2,
+                                                        double& q3) {
+  filter_.getOrientation(q0, q1, q2, q3);
+  // Rotation from magnetic frame to IMU frame.
+  const tf2::Quaternion q_MB(q1, q2, q3, q0);
+  // Rotation from geographic frame to magnetic frame.
+  const tf2::Vector3 z_axis(0.0, 0.0, 1.0);
+  const tf2::Quaternion q_GM(z_axis, mag_declination_);
+  tf2::Quaternion q_GB = q_GM * q_MB;
+  q0 = q_GB.getW();
+  q1 = q_GB.getX();
+  q2 = q_GB.getY();
+  q3 = q_GB.getZ();
+}
 
 void ImuFilterRos::reconfigCallback(FilterConfig& config, uint32_t level)
 {
@@ -373,11 +434,7 @@ void ImuFilterRos::reconfigCallback(FilterConfig& config, uint32_t level)
   filter_.setDriftBiasGain(zeta);
   ROS_INFO("Imu filter gain set to %f", gain);
   ROS_INFO("Gyro drift bias set to %f", zeta);
-  mag_bias_.x = config.mag_bias_x;
-  mag_bias_.y = config.mag_bias_y;
-  mag_bias_.z = config.mag_bias_z;
   orientation_variance_ = config.orientation_stddev * config.orientation_stddev;
-  ROS_INFO("Magnetometer bias values: %f %f %f", mag_bias_.x, mag_bias_.y, mag_bias_.z);
 }
 
 void ImuFilterRos::imuMagVectorCallback(const MagVectorMsg::ConstPtr& mag_vector_msg)
